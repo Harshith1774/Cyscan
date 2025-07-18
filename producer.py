@@ -70,14 +70,14 @@ def main():
             # Flush the producer to make sure all messages are sent.
             producer.flush()
             
-            print("Data sent successfully. Waiting for 10 seconds...")
+            print("Data sent successfully. Waiting for 5 seconds...")
             # Wait for 10 seconds before collecting data again.
-            time.sleep(10)
+            time.sleep(5)
 
         except Exception as e:
             print(f"An error occurred: {e}")
             # If something goes wrong (e.g., Kafka is down), wait a bit and try again.
-            time.sleep(15)
+            time.sleep(10)
 
 if __name__ == "__main__":
     main()
