@@ -1,63 +1,73 @@
 import faust
 import json
+import joblib
+import pandas as pd
+import os
 
 # --- Configuration ---
-# Define the Kafka broker address.
 KAFKA_BROKER = 'kafka://localhost:9092'
+MODEL_FILE = 'isolation_forest_model.joblib'
+# The features must be in the exact same order as when we trained the model.
+FEATURES = ['pid', 'ppid', 'create_time']
+# NEW: We now define a threshold for our anomaly score.
+# Only scores BELOW this number will trigger an alert.
+# We can tune this value to make the detector more or less sensitive.
+ALERT_THRESHOLD = -0.15
 
 # --- Faust Application Setup ---
-# 1. Create the Faust 'app'. This is the main object for our stream processor.
-#    We give it a name ('cyscan-engine') and tell it where to find Kafka.
-app = faust.App('cyscan-engine', broker=KAFKA_BROKER)
+app = faust.App('cyscan-engine-ml', broker=KAFKA_BROKER, value_serializer='json')
 
-# 2. Define the "topics". A topic is a channel of data in Kafka.
-#    Faust needs to know about the topics we're reading from and writing to.
-#    We define the input topic where our process data arrives.
 input_topic = app.topic('osquery-events')
-
-#    We define the output topic where we will send our generated alerts.
 output_topic = app.topic('security-alerts')
+
+# --- Load the ML Model ---
+# We load the model once when the application starts.
+if not os.path.exists(MODEL_FILE):
+    print(f"FATAL: Model file not found at '{MODEL_FILE}'")
+    print("Please run train_model.py first.")
+    exit()
+
+print(f"Loading model from {MODEL_FILE}...")
+model = joblib.load(MODEL_FILE)
+print("Model loaded successfully.")
 
 
 # --- The Detection Logic ---
-# 3. Define the "agent". An agent is a function that processes messages from a topic.
-#    The decorator '@app.agent(input_topic)' tells Faust that this function
-#    should be run for every single message that arrives on the 'input_topic'.
 @app.agent(input_topic)
 async def process_event(events):
-    # The 'events' parameter is a stream of messages from Kafka.
-    # We can loop through them asynchronously.
     async for event in events:
         try:
-            # The event from Kafka is in bytes, so we need to decode and parse it as JSON.
-            # Note: Faust can do this automatically with "models", but we'll do it manually
-            # for clarity in this first version.
             data = event
+            columns = data.get("columns", {})
 
-            # --- THIS IS OUR DETECTION RULE ---
-            # We will check if the process name is 'Calculator'.
-            # This is a very simple rule for testing purposes.
-            process_name = data.get("columns", {}).get("name")
-            
-            if process_name and "Calculator" in process_name:
+            # --- 1. Feature Preparation ---
+            if all(key in columns for key in ['pid', 'parent', 'create_time']):
+                feature_values = [
+                    columns['pid'],
+                    columns['parent'],
+                    columns['create_time']
+                ]
+                df_point = pd.DataFrame([feature_values], columns=FEATURES)
+
+                # --- 2. Anomaly Scoring ---
+                # THE FIX IS HERE: We now get a continuous score instead of a binary prediction.
+                # Lower scores mean more anomalous.
+                score = model.score_samples(df_point)
                 
-                # If the rule matches, we create an alert.
-                alert = {
-                    "alert_type": "Suspicious Process Detected",
-                    "process_name": process_name,
-                    "pid": data.get("columns", {}).get("pid"),
-                    "message": "A process matching a suspicious name was found: Calculator.app"
-                }
+                # --- 3. Alert Generation based on Threshold ---
+                if score[0] < ALERT_THRESHOLD:
+                    process_name = columns.get("name", "N/A")
+                    alert = {
+                        "alert_type": "Anomaly Detected (Isolation Forest)",
+                        "process_name": process_name,
+                        "pid": columns.get("pid"),
+                        "anomaly_score": score[0],
+                        "message": f"A process with a high anomaly score was detected: {process_name}"
+                    }
+                    # We also print the score for easier debugging.
+                    print(f"!!! ANOMALY ALERT: Process '{process_name}' | Score: {score[0]:.4f} !!!")
+                    await output_topic.send(value=alert)
 
-                print(f"!!! ALERT: Found suspicious process: {process_name} !!!")
-
-                # 4. Send the alert to our output topic.
-                #    The '.send()' method is asynchronous, so we use 'await'.
-                await output_topic.send(value=json.dumps(alert).encode('utf-8'))
-
-        except json.JSONDecodeError:
-            # If a message isn't valid JSON, we'll just ignore it.
-            print("Warning: Could not decode message.")
         except Exception as e:
             print(f"An error occurred in the agent: {e}")
 

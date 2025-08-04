@@ -1,27 +1,24 @@
 import time
 import json
 import psutil
+import os
+import csv
 from kafka import KafkaProducer
 
 # --- Configuration ---
-# This is the address of our Kafka broker running in Docker.
 KAFKA_BROKER = 'localhost:9092'
-# This is the name of the Kafka topic we will send our data to.
 KAFKA_TOPIC = 'osquery-events'
+BASELINE_CSV_FILE = 'baseline_data.csv' # The file to store our training data
+CSV_HEADER = ['pid', 'ppid', 'create_time'] # The features we will use
 
 def get_process_data():
     """
     Gathers data for all running processes using psutil.
-    Formats the data to look similar to OSquery's process_events.
     """
     process_list = []
     for proc in psutil.process_iter(['pid', 'name', 'username', 'create_time', 'ppid']):
         try:
-            # Get process information as a dictionary
             pinfo = proc.info
-            
-            # We will create a JSON object that mimics the structure of an OSquery event.
-            # This makes it easier for our detection engine later.
             event = {
                 "name": "process_events",
                 "columns": {
@@ -31,53 +28,71 @@ def get_process_data():
                     "create_time": pinfo['create_time'],
                     "parent": pinfo['ppid']
                 },
-                "action": "snapshot" # We'll call it a 'snapshot' event
+                "action": "snapshot"
             }
             process_list.append(event)
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            # Some processes might disappear while we are iterating, so we just ignore them.
             pass
     return process_list
+
+def write_to_csv(processes):
+    """
+    Writes the selected features for each process to a CSV file.
+    """
+    # Check if the file already exists to decide whether to write the header.
+    file_exists = os.path.isfile(BASELINE_CSV_FILE)
+
+    # Open the file in 'append' mode ('a'). This adds new rows without deleting old ones.
+    with open(BASELINE_CSV_FILE, 'a', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=CSV_HEADER)
+
+        # If the file is new, write the header row.
+        if not file_exists:
+            writer.writeheader()
+
+        # Loop through all processes and write their data.
+        for process_data in processes:
+            columns = process_data.get("columns", {})
+            # We only write the row if all our required features are present.
+            if all(key in columns for key in ['pid', 'parent', 'create_time']):
+                writer.writerow({
+                    'pid': columns['pid'],
+                    'ppid': columns['parent'],
+                    'create_time': columns['create_time']
+                })
 
 def main():
     """
     Main function to run the producer.
     """
-    print("Starting CyScan Producer...")
+    print("Starting CyScan Producer (with data logging)...")
     
-    # Create the Kafka producer client.
-    # It will automatically try to connect to the broker.
-    # The value_serializer tells the producer how to convert our Python dictionary to bytes.
     producer = KafkaProducer(
         bootstrap_servers=KAFKA_BROKER,
         value_serializer=lambda v: json.dumps(v).encode('utf-8')
     )
-
     print(f"Connected to Kafka broker at {KAFKA_BROKER}")
+    print(f"Logging baseline data to '{BASELINE_CSV_FILE}'")
 
-    # The main loop
     while True:
         try:
-            # Get the list of all running processes
             processes = get_process_data()
             
-            print(f"Found {len(processes)} processes. Sending to Kafka topic '{KAFKA_TOPIC}'...")
-
-            # Send each process's data as a separate message to Kafka
+            # --- Send to Kafka (no change here) ---
+            print(f"Found {len(processes)} processes. Sending to Kafka...")
             for process_data in processes:
                 producer.send(KAFKA_TOPIC, process_data)
-            
-            # Flush the producer to make sure all messages are sent.
             producer.flush()
             
-            print("Data sent successfully. Waiting for 5 seconds...")
-            # Wait for 10 seconds before collecting data again.
+            # --- NEW: Write to CSV for training ---
+            write_to_csv(processes)
+            print("Logged data to CSV. Waiting for 5 seconds...")
+            
             time.sleep(5)
 
         except Exception as e:
             print(f"An error occurred: {e}")
-            # If something goes wrong (e.g., Kafka is down), wait a bit and try again.
-            time.sleep(10)
+            time.sleep(15)
 
 if __name__ == "__main__":
     main()
